@@ -28,6 +28,16 @@ ticket llega → RAG busca contexto → LangGraph clasifica
 ollama pull llama3
 ollama pull nomic-embed-text
 
+## Variables de entorno requeridas
+Crea un archivo .env o configura estas variables antes de correr el proyecto:
+
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=tickets
+DB_USER=tu_usuario
+DB_PASSWORD=tu_contraseña
+APP_ENV=development
+
 ## Cómo correr el proyecto
 
 ### 1. Clonar el repositorio
@@ -98,4 +108,4 @@ Respuesta:
 - RAG sobre documentos de soporte técnico
 - Responde en español e inglés
 - Tickets urgentes guardados automáticamente en PostgreSQL
-- Variables de entorno con GitHub Secrets
+- Credenciales manejadas via variables de entorno
