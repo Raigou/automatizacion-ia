@@ -1,0 +1,17 @@
+[
+  {"texto": "El sistema de pagos está caído, no podemos procesar ninguna transacción", "urgente": true, "categoria": "tecnico"},
+  {"texto": "Perdimos todos los datos de la base de producción tras la actualización", "urgente": true, "categoria": "tecnico"},
+  {"texto": "Nadie de mi equipo puede iniciar sesión en la plataforma desde esta mañana", "urgente": true, "categoria": "tecnico"},
+  {"texto": "Nos cobraron dos veces la suscripción y la tarjeta quedó bloqueada", "urgente": true, "categoria": "facturacion"},
+  {"texto": "La API devuelve error 500 en todas las peticiones y nuestros clientes no pueden comprar", "urgente": true, "categoria": "tecnico"},
+  {"texto": "Hola, tengo una consulta sobre cómo funciona GPT-4", "urgente": false, "categoria": "consulta"},
+  {"texto": "¿Pueden explicarme cuáles son las limitaciones del modelo?", "urgente": false, "categoria": "consulta"},
+  {"texto": "Quisiera saber cómo descargar mi factura del mes pasado", "urgente": false, "categoria": "facturacion"},
+  {"texto": "¿Cómo cambio el correo asociado a mi cuenta?", "urgente": false, "categoria": "consulta"},
+  {"texto": "La página de reportes carga un poco lenta, pero funciona", "urgente": false, "categoria": "tecnico"},
+  {"texto": "Me gustaría sugerir un modo oscuro para el panel", "urgente": false, "categoria": "otro"},
+  {"texto": "Hi, how can I export my data to CSV?", "urgente": false, "categoria": "consulta"},
+  {"texto": "Our production server is down and we are losing money every minute", "urgente": true, "categoria": "tecnico"},
+  {"texto": "Hay un cargo en mi estado de cuenta que no reconozco, ¿me ayudan a revisarlo?", "urgente": false, "categoria": "facturacion"},
+  {"texto": "Gracias por la ayuda de ayer, todo quedó resuelto", "urgente": false, "categoria": "otro"}
+]

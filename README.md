@@ -1,111 +1,300 @@
-# Automatización IA — Agente Clasificador de Tickets
+# Automatización IA: Agente Clasificador de Tickets
 
-Sistema de automatización empresarial que clasifica tickets de soporte usando un agente LangGraph con RAG, guarda los urgentes en PostgreSQL y orquesta el flujo con n8n.
+Agente de soporte que clasifica tickets de clientes. Un modelo local (Ollama) decide qué herramientas usar (buscar en manuales con RAG, consultar tickets anteriores en PostgreSQL), entrega una clasificación validada con Pydantic y, si el ticket es urgente, el código lo guarda en la base de datos.
+
+El proyecto empezó como un **flujo** con LangGraph (el código decidía el camino) y evolucionó a un **agente con herramientas** (el modelo decide). Las secciones finales documentan ese cambio, las pruebas que se hicieron y los problemas encontrados.
 
 ## Tecnologías
+
 - Python 3.11
 - FastAPI
-- LangGraph (agente con flujo condicional)
-- LangChain + ChromaDB (RAG)
-- Ollama (Llama3 + nomic-embed-text)
-- PostgreSQL
-- n8n
-- Docker Compose
+- LangChain 1.x (`create_agent`) sobre LangGraph
+- ChromaDB + `langchain-chroma` (RAG)
+- Ollama: `qwen2.5:7b` (agente) y `nomic-embed-text` (embeddings)
+- Pydantic y pydantic-settings (esquemas y configuración)
+- PostgreSQL 15 (Docker Compose)
+- n8n (levantado en el compose, **aún no conectado** a la API)
 
 ## Arquitectura
 
-ticket llega → RAG busca contexto → LangGraph clasifica
-                                          ↓
-                                    ¿es urgente?
-                                    sí → guarda en PostgreSQL
-                                    no → devuelve clasificación
+```
+Ticket llega (POST /procesar-ticket)
+        |
+        v
+   AGENTE (qwen2.5:7b) decide qué hacer
+        |-- buscar_manuales     -> rag/store.py       -> chroma_db/
+        |-- tickets_similares   -> db/repository.py   -> PostgreSQL
+        v
+   Clasificacion (validada con Pydantic)
+        |
+        v
+   CÓDIGO: si urgente == true -> repository.guardar_ticket() -> PostgreSQL
+        |
+        v
+   Respuesta TicketOut
+```
+
+Decisión de diseño importante: **el agente decide qué herramientas de lectura usar, pero el guardado en la base lo hace el código**. Ver la sección "Por qué el guardado no es una herramienta del agente".
+
+## Estructura del proyecto
+
+```
+automatizacion-ia/
+├── app/
+│   ├── main.py          # crea la app FastAPI; construye el agente una vez (lifespan)
+│   ├── routes.py        # endpoints GET / y POST /procesar-ticket
+│   ├── config.py        # variables de entorno tipadas (pydantic-settings)
+│   └── schemas.py       # TicketIn, Clasificacion, TicketOut
+├── agent/
+│   ├── builder.py       # construir_agente, clasificar_ticket, procesar_ticket
+│   ├── tools.py         # buscar_manuales, tickets_similares
+│   └── prompts.py       # prompt de sistema
+├── rag/
+│   ├── ingest.py        # indexa los PDFs (se corre una vez)
+│   └── store.py         # abre el índice y busca
+├── db/
+│   ├── init.sql         # crea la tabla al primer arranque de Postgres
+│   └── repository.py    # único archivo con SQL
+├── eval/
+│   ├── dataset.json     # 15 tickets etiquetados a mano
+│   └── run_eval.py      # mide aciertos de urgencia y categoría
+├── legacy/              # copias del proyecto original (flujo LangGraph), solo referencia
+├── data/                # PDFs que se indexan
+├── .env.example
+├── docker-compose.yml
+└── requirements.txt
+```
 
 ## Requisitos previos
+
+- Python 3.11 y un entorno virtual
 - Ollama instalado y corriendo
 - Docker Desktop corriendo
 - Modelos descargados:
 
-ollama pull llama3
+```
+ollama pull qwen2.5:7b
 ollama pull nomic-embed-text
+```
 
-## Variables de entorno requeridas
-Crea un archivo .env o configura estas variables antes de correr el proyecto:
+> El modelo debe soportar *tool calling*. `llama3` original no lo soporta bien en Ollama, por eso se usa `qwen2.5:7b`.
 
+## Configuración
+
+Copia la plantilla y completa tus valores:
+
+```
+copy .env.example .env
+```
+
+```
+APP_ENV=development
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=tickets
-DB_USER=tu_usuario
+DB_USER=admin
 DB_PASSWORD=tu_contraseña
-APP_ENV=development
+OLLAMA_HOST=http://localhost:11434
+```
+
+`.env` no se sube a GitHub. El `docker-compose.yml` lee las mismas variables, así que las credenciales viven en un solo lugar. Si falta una variable obligatoria, la app falla al arrancar con un mensaje claro.
 
 ## Cómo correr el proyecto
 
-### 1. Clonar el repositorio
-
+```
 git clone https://github.com/Raigou/automatizacion-ia.git
 cd automatizacion-ia
-
-### 2. Agregar PDFs de manuales
-Coloca tus archivos PDF en la carpeta data/
-
-### 3. Levantar PostgreSQL y n8n
-
-docker-compose up -d
-
-### 4. Crear la tabla de tickets
-
-docker exec -it postgres-tickets psql -U admin -d tickets -c "CREATE TABLE IF NOT EXISTS tickets (id SERIAL PRIMARY KEY, texto TEXT, categoria VARCHAR(50), resumen TEXT, solucion_sugerida TEXT, creado_en TIMESTAMP DEFAULT NOW());"
-
-### 5. Instalar dependencias
-
 pip install -r requirements.txt
+```
 
-### 6. Correr la API
+1. **Agrega tus PDFs** en `data/`.
+2. **Levanta Postgres y n8n.** La tabla se crea sola desde `db/init.sql`:
+   ```
+   docker-compose up -d
+   ```
+3. **Indexa los PDFs** (una sola vez, o cuando cambien los PDFs):
+   ```
+   python -m rag.ingest
+   ```
+4. **Corre la API:**
+   ```
+   uvicorn app.main:app --host 127.0.0.1 --port 8000
+   ```
+5. **Prueba** en http://127.0.0.1:8000/docs
 
-uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-### 7. Probar
-Abre http://127.0.0.1:8000/docs
+> `init.sql` solo se ejecuta cuando el volumen de Postgres está vacío. Si cambias la tabla, usa `docker-compose down -v` (borra los datos) y vuelve a levantar.
 
 ## Ejemplo
 
 Ticket no urgente:
-{
-  "texto": "Hola, tengo una consulta sobre cómo funciona GPT-4"
-}
 
-Respuesta:
+```json
+{"texto": "Hola, tengo una consulta sobre cómo funciona GPT-4"}
+```
+
+```json
 {
   "texto_original": "Hola, tengo una consulta sobre cómo funciona GPT-4",
   "clasificacion": {
     "urgente": false,
     "categoria": "consulta",
-    "resumen": "El cliente tiene una consulta sobre cómo funciona GPT-4",
+    "resumen": "Consulta sobre cómo funciona GPT-4",
     "solucion_sugerida": null
   },
   "guardado_en_db": false
 }
+```
 
 Ticket urgente:
-{
-  "texto": "El sistema de pagos está caído, no podemos procesar ninguna transacción"
-}
 
-Respuesta:
+```json
+{"texto": "El sistema de pagos está caído, no podemos procesar ninguna transacción"}
+```
+
+```json
 {
   "texto_original": "El sistema de pagos está caído, no podemos procesar ninguna transacción",
   "clasificacion": {
     "urgente": true,
-    "categoria": "facturacion",
-    "resumen": "El sistema de pagos está caído",
+    "categoria": "tecnico",
+    "resumen": "El sistema de pagos está caído y no podemos procesar ninguna transacción.",
     "solucion_sugerida": null
   },
   "guardado_en_db": true
 }
+```
 
-## Características
-- Agente con flujo condicional usando LangGraph
-- RAG sobre documentos de soporte técnico
-- Responde en español e inglés
-- Tickets urgentes guardados automáticamente en PostgreSQL
-- Credenciales manejadas via variables de entorno
+## Evaluación
+
+```
+python -m eval.run_eval
+```
+
+Corre el agente sobre `eval/dataset.json` (15 tickets: 6 urgentes y 9 no urgentes, con casos ambiguos a propósito y uno en inglés) y compara con las etiquetas. Usa `clasificar_ticket`, que **no escribe en la base de datos**, así que la evaluación no ensucia la tabla.
+
+### Resultados por variante
+
+| Variante | Urgencia | Categoría | Errores |
+|---|---|---|---|
+| `ToolStrategy`, sin reintento | 13/15 | 10/15 | 2 |
+| `ToolStrategy` + reintento simple | 14/15 | 11/15 | 1 |
+| `ProviderStrategy` (no es un agente, ver abajo) | 15/15 | 7/15 | 0 |
+| `ToolStrategy` + categorías definidas en el prompt | 14/15 | 13/15 | 1 |
+| **`ToolStrategy` + categorías + reintento con continuación (final)** | **15/15** | **14/15** | **0** |
+
+Cuando hay errores, los porcentajes de urgencia y categoría se calculan sobre los 15 tickets, así que un error cuenta como fallo.
+
+### Sobre la etiqueta del ticket 1
+
+El ticket "El sistema de pagos está caído..." estaba etiquetado como `facturacion`. Se decidió que una caída del sistema es un problema **técnico** (aunque involucre pagos) y se cambió la etiqueta a `tecnico`.
+
+Después del cambio, la categoría **siguió en 14/15**, porque la respuesta del modelo para este ticket **no es estable**: en las mediciones anteriores respondía `tecnico` y en la última respondió `facturacion`, aun con `temperature=0`. Solo se invirtió cuál es el desacierto.
+
+Hipótesis sin verificar: la diferencia viene de lo que devuelve `tickets_similares`. En las mediciones anteriores la tabla tenía tickets de pagos ya guardados como `tecnico`, y en la última la tabla pudo estar vacía tras un `DELETE`. Si es así, el resultado del agente depende del contenido de la base, algo a tener en cuenta al evaluar.
+
+Es un caso genuinamente ambiguo, y la cifra honesta de la variante final es **14/15 en categoría**.
+
+### Cómo interpretar estos números
+
+- Son 15 tickets: un solo caso mueve 7 puntos porcentuales.
+- El prompt se ajustó mirando estos mismos 15 tickets, así que hay **riesgo de sobreajuste**. Es una medición inicial, no una cifra definitiva.
+- Una mejora pendiente: agregar tickets nuevos que no se hayan usado para ajustar nada y medir solo con ellos.
+
+## Historial de cambios: del flujo al agente
+
+### Punto de partida (proyecto original)
+
+- `model/agent.py`: grafo de LangGraph con dos nodos (`clasificar` y `guardar_db`) y una arista condicional (`decidir_siguiente`). El **código** decidía el camino; el modelo solo rellenaba un JSON.
+- `model/rag.py`: cargaba y indexaba los PDFs.
+- `app/main.py`: ejecutaba el RAG **siempre** antes de clasificar, e **indexaba los PDFs en cada arranque**.
+- Modelo: `llama3`, llamado con el cliente `ollama` directamente.
+
+Problemas detectados al revisarlo:
+
+1. Cada arranque de la API reindexaba el PDF y duplicaba los chunks en Chroma.
+2. `json.loads` sin protección: una respuesta ligeramente inválida causaba un error 500.
+3. Conexión a Postgres sin cierre garantizado si el `INSERT` fallaba.
+4. `os.getenv` repartido en varios archivos, sin validación.
+5. Se exponía `str(e)` al cliente en los errores.
+6. La tabla se creaba a mano con `docker exec`.
+7. `llama3` no soporta bien *tool calling*, que es lo que necesita un agente.
+
+### Cambios por archivo
+
+| Archivo | Qué se hizo | Por qué |
+|---|---|---|
+| `.env` / `.env.example` | Variables de entorno en un solo lugar, con plantilla sin secretos. | Eliminar la inconsistencia de credenciales entre README, compose y código. |
+| `docker-compose.yml` | Credenciales leídas desde `.env` (`${DB_USER}`...), `healthcheck` en Postgres, montaje de `db/init.sql`, se eliminó `version:` (obsoleto). | Una sola fuente de credenciales; saber cuándo Postgres está listo; tabla automática. |
+| `db/init.sql` (nuevo) | Crea la tabla `tickets`, con una columna nueva `urgente`. | Reemplaza el paso manual y deja explícito el estado de urgencia. |
+| `app/config.py` (nuevo) | Clase `Settings` (pydantic-settings) y `get_settings()` con `lru_cache`. | Falla al arrancar si falta una variable; valida tipos (`db_port` como `int`). El modelo queda como configuración (`llm_model`). |
+| `app/schemas.py` (nuevo) | `TicketIn`, `Clasificacion` (con `Categoria` como `Literal`) y `TicketOut`. | Contrato de entrada y salida validado. Una categoría inventada por el modelo se rechaza en vez de llegar a la base. |
+| `db/repository.py` (nuevo) | `guardar_ticket` y `buscar_tickets_similares`, con consultas parametrizadas. | Único lugar con SQL. Los `with` confirman o deshacen la transacción. |
+| `rag/ingest.py` (nuevo) | Carga PDFs, los trocea (1000 caracteres, solape de 100), genera embeddings y los guarda en Chroma. Usa `langchain-chroma`. | Separar **indexar** de **consultar**: se acaban los chunks duplicados y los arranques lentos. |
+| `rag/store.py` (nuevo) | `get_vectorstore()` (con `lru_cache`) y `buscar_contexto()`. | Abre el índice existente sin reindexar. Usa el mismo modelo de embeddings que la indexación. |
+| `agent/tools.py` (nuevo) | Herramientas `buscar_manuales` y `tickets_similares` con `@tool`. | El modelo decide si usarlas y con qué consulta. Los docstrings son lo que el modelo lee para decidir. |
+| `agent/prompts.py` (nuevo) | Prompt de sistema con pasos, definición de urgencia y definición de cada categoría. | Separar el comportamiento del agente de la lógica. Las categorías definidas subieron el acierto (ver resultados). |
+| `agent/builder.py` (nuevo) | `construir_agente`, `clasificar_ticket` y `procesar_ticket`. | Ver detalle abajo. |
+| `app/main.py` (reescrito) | `lifespan` construye el agente una vez y lo guarda en `app.state`. | Ya no se ejecuta código al importar el módulo. |
+| `app/routes.py` (nuevo) | Endpoints con `response_model=TicketOut`; el error se registra en el log y el cliente recibe un mensaje genérico. | La salida queda validada y documentada en `/docs`; no se filtran detalles internos. |
+| `eval/dataset.json` y `eval/run_eval.py` (nuevos) | Set de 15 tickets y script de evaluación. | Poder responder "¿cómo mediste si funciona?". |
+| `legacy/` | Copias de `main.py`, `agent.py` y `rag.py` originales. | Conservar el flujo original para comparar. |
+
+### Cambios por función (`agent/builder.py`)
+
+- **`construir_agente()`**: crea `ChatOllama(temperature=0)` y llama a `create_agent` con las herramientas, el prompt y `response_format=ToolStrategy(Clasificacion)`.
+- **`clasificar_ticket(agente, texto)`**: solo clasifica y **no escribe en la base**. Evolucionó en tres versiones:
+  1. Sin reintento: devolvía `resultado["structured_response"]` directamente. Fallaba con `KeyError` cuando el modelo no entregaba la clasificación.
+  2. Reintento simple: repetía la misma pregunta hasta 3 veces. Con `temperature=0` el modelo daba casi siempre la misma respuesta, así que servía poco.
+  3. **Reintento con continuación (final):** si falta la clasificación, agrega al historial "Entrega ahora la clasificación final." y vuelve a invocar. Cada intento es distinto del anterior y el modelo conserva lo que ya buscó.
+- **`procesar_ticket(agente, texto)`**: llama a `clasificar_ticket` y, si `urgente` es verdadero, guarda con `repository.guardar_ticket`. `guardado_en_db` es verdadero solo si el código ejecutó el guardado.
+
+### Por qué el guardado no es una herramienta del agente
+
+Primero `guardar_ticket` sí era una herramienta. En las pruebas, el modelo **nunca la llamó**: clasificaba el ticket como urgente y entregaba la clasificación final directamente. Reescribir el prompt con más énfasis hizo que usara las herramientas de lectura, pero siguió sin guardar.
+
+Se decidió separar *decidir* de *ejecutar*: el agente clasifica y el código guarda. Resultado: el guardado es determinista (si es urgente, se guarda siempre). El trade-off es que el agente ya no decide la acción con efecto secundario; sigue decidiendo qué herramientas de lectura usar y con qué consulta. Se probó el cambio con la prueba de pagos caídos y se confirmó la fila en Postgres.
+
+## Pruebas y diagnósticos realizados
+
+Durante el desarrollo se usaron scripts temporales. No forman parte del proyecto final, pero cada uno respondió una pregunta concreta:
+
+| Script | Qué verificaba | Qué se encontró |
+|---|---|---|
+| `prueba_tools.py` | Si `qwen2.5:7b` hace *tool calling* con `bind_tools`. | Sí: llamó a `buscar_manuales` con la consulta "sistema de pagos caído". |
+| Comandos `python -c ...` | `config.py` (valores cargados), `schemas.py` (rechazo de una categoría inventada), `repository.py` (insertar y leer), `rag/store.py` (búsqueda con "GPT-4 capabilities") y las herramientas sin el modelo. | Cada pieza funcionó de forma aislada antes de armar el agente. |
+| `python -c "...inspect.signature(create_agent)"` | La firma real de `create_agent` en LangChain 1.3. | Confirmó `system_prompt` y `response_format`. En esta versión el agente se crea con `create_agent`, no con `create_react_agent`. |
+| `prueba_agente.py` | El agente con un ticket no urgente y uno urgente. | El ticket urgente salió con `urgente: true` pero `guardado_en_db: false`. |
+| `diagnostico.py` (1.ª vez) | Los mensajes internos del agente. | El modelo llamaba directo a `Clasificacion` y se saltaba todas las herramientas. |
+| `diagnostico.py` (2.ª vez, tras reescribir el prompt) | Lo mismo con el prompt nuevo. | Ya usaba `buscar_manuales` y `tickets_similares`, pero seguía sin llamar a `guardar_ticket`. Llevó a mover el guardado al código. |
+| `diagnostico2.py` | Por qué fallaba el ticket 15 con `KeyError: 'structured_response'`. | El modelo escribió `Clasificacion {...}` como **texto** en vez de hacer la llamada a la herramienta. |
+| `diagnostico.py` (con `ProviderStrategy`) | Por qué cayó la categoría a 7/15. | El agente **dejó de usar herramientas**: con el formato forzado por Ollama, la primera respuesta ya es el JSON final. Esa variante es un clasificador de un paso, no un agente, y se descartó. |
+| `diagnostico3.py` | Por qué fallaba el ticket 4. | Tras leer el resultado de `tickets_similares`, el modelo respondió **vacío**. Es un fallo distinto al anterior y motivó el reintento con continuación. |
+
+### Hallazgos principales
+
+1. **El prompt no garantiza que el modelo use una herramienta.** Se midió y se resolvió moviendo la acción crítica (guardar) al código.
+2. **`ToolStrategy` vs `ProviderStrategy`.** `ToolStrategy` mantiene el ciclo de herramientas pero un modelo de 7B a veces falla el formato (texto en vez de llamada, o respuesta vacía). `ProviderStrategy` elimina los errores de formato pero elimina también el comportamiento de agente. Se eligió `ToolStrategy` con reintento.
+3. **Definir las categorías en el prompt** fue el cambio que más mejoró la clasificación (de 11/15 a 13/15 en categoría).
+4. **Un reintento idéntico no sirve con `temperature=0`.** Hay que cambiar algo entre intentos.
+
+## Limitaciones conocidas
+
+- **El manual es el paper de GPT-4**, no un manual de soporte. El RAG demuestra la arquitectura, pero sus resultados no ayudan a resolver tickets reales (por ejemplo, para "sistema de pagos caído" devolvió texto sobre lavado de dinero). `solucion_sugerida` casi siempre queda en `null`.
+- **Evaluación pequeña:** 15 tickets, prompt ajustado sobre los mismos casos, riesgo de sobreajuste.
+- **Etiqueta ambigua e inestable:** "pagos caídos" (`tecnico` vs `facturacion`) es una decisión de criterio, y el modelo cambió su respuesta entre mediciones sin que cambiara el código. Una sola corrida no basta para afirmar un resultado.
+- **Formato inestable en modelos de 7B:** el reintento lo reduce, pero no lo elimina por completo. Si fallan todos los intentos, la API devuelve 500.
+- **`tickets_similares` usa coincidencia de texto (`ILIKE`)**, no búsqueda semántica. Una mejora sería usar `pgvector`.
+- **Los tickets guardados influyen en las búsquedas del agente.** Los tickets de prueba en la tabla aparecieron en `tickets_similares`.
+- **n8n está en el compose pero no está conectado** a la API.
+- **No hay tests automáticos** (por ejemplo con `pytest`); la verificación se hizo con los scripts de arriba y la evaluación.
+- `langchain-community` está en proceso de retiro (aparece un `DeprecationWarning` al cargar PDFs con `PyPDFLoader`).
+
+## Próximos pasos
+
+- Reemplazar el PDF por un manual de soporte real.
+- Ampliar el set de evaluación y medir con tickets no usados para ajustar el prompt.
+- Probar otros modelos (`llama3.1`) y comparar contra `qwen2.5:7b`.
+- Exponer una de las herramientas como servidor MCP.
+- Conectar n8n a la API con un webhook.
+- Agregar tests con `pytest`.
+- Dockerizar la API: el Dockerfile original quedó en la rama `legacy`. Hay que actualizarlo a la estructura nueva y configurar `OLLAMA_HOST` y `DB_HOST` para que funcione dentro de Docker.
