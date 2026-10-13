@@ -12,7 +12,8 @@ El proyecto empezó como un **flujo** con LangGraph (el código decidía el cami
 - ChromaDB + `langchain-chroma` (RAG)
 - Ollama: `qwen2.5:7b` (agente) y `nomic-embed-text` (embeddings)
 - Pydantic y pydantic-settings (esquemas y configuración)
-- PostgreSQL 15 (Docker Compose)
+- PostgreSQL 15
+- Docker y Docker Compose (la API, Postgres y n8n se levantan con un comando; Ollama corre fuera de Docker)
 - n8n (levantado en el compose, **aún no conectado** a la API)
 
 ## Arquitectura
@@ -35,6 +36,19 @@ Ticket llega (POST /procesar-ticket)
 ```
 
 Decisión de diseño importante: **el agente decide qué herramientas de lectura usar, pero el guardado en la base lo hace el código**. Ver la sección "Por qué el guardado no es una herramienta del agente".
+
+### Despliegue con Docker
+
+```
+Navegador (127.0.0.1:8000)
+        |
+        v
+[contenedor tickets-api] --"postgres:5432"--> [contenedor postgres-tickets]
+        |
+        +--"host.docker.internal:11434"--> Ollama (en tu computador, fuera de Docker)
+```
+
+Ollama se deja fuera de Docker a propósito: los modelos ya están descargados en el computador y así no se duplican varios GB dentro de un contenedor.
 
 ## Estructura del proyecto
 
@@ -61,7 +75,9 @@ automatizacion-ia/
 ├── legacy/              # copias del proyecto original (flujo LangGraph), solo referencia
 ├── data/                # PDFs que se indexan
 ├── .env.example
-├── docker-compose.yml
+├── .dockerignore        # qué no se copia a la imagen (venv, .env, chroma_db...)
+├── Dockerfile           # imagen de la API
+├── docker-compose.yml   # postgres + api + n8n
 └── requirements.txt
 ```
 
@@ -95,34 +111,67 @@ DB_NAME=tickets
 DB_USER=admin
 DB_PASSWORD=tu_contraseña
 OLLAMA_HOST=http://localhost:11434
+N8N_USER=admin
+N8N_PASSWORD=tu_contraseña_de_n8n
 ```
 
 `.env` no se sube a GitHub. El `docker-compose.yml` lee las mismas variables, así que las credenciales viven en un solo lugar. Si falta una variable obligatoria, la app falla al arrancar con un mensaje claro.
 
+Con Docker, el compose **pisa** dos valores del `.env` para el contenedor de la API: `DB_HOST=postgres` y `OLLAMA_HOST=http://host.docker.internal:11434`. Las variables de entorno tienen prioridad sobre el archivo `.env`, así que el `.env` puede seguir con `localhost` para correr la API directamente en tu computador.
+
 ## Cómo correr el proyecto
 
-```
-git clone https://github.com/Raigou/automatizacion-ia.git
-cd automatizacion-ia
-pip install -r requirements.txt
-```
+### Opción A: con Docker (recomendada)
 
-1. **Agrega tus PDFs** en `data/`.
-2. **Levanta Postgres y n8n.** La tabla se crea sola desde `db/init.sql`:
+Levanta Postgres, la API y n8n con un solo comando. Ollama sigue corriendo en tu computador, fuera de Docker.
+
+1. **Clona el repositorio y entra a la carpeta:**
    ```
-   docker-compose up -d
+   git clone https://github.com/Raigou/automatizacion-ia.git
+   cd automatizacion-ia
    ```
-3. **Indexa los PDFs** (una sola vez, o cuando cambien los PDFs):
+2. **Crea tu `.env`** a partir de la plantilla y completa las contraseñas (incluidas `N8N_USER` y `N8N_PASSWORD`):
+   ```
+   copy .env.example .env
+   ```
+3. **Agrega tus PDFs** en `data/`.
+4. **Asegúrate de que Ollama esté corriendo** y de tener los modelos descargados (ver "Requisitos previos").
+5. **Construye y levanta los contenedores.** La tabla se crea sola desde `db/init.sql`:
+   ```
+   docker-compose up -d --build
+   ```
+6. **Indexa los PDFs** dentro de Docker (una sola vez, o cuando cambien los PDFs):
+   ```
+   docker-compose run --rm api python -m rag.ingest
+   ```
+7. **Prueba** en http://127.0.0.1:8000/docs
+
+Cómo se conectan las piezas:
+
+- La API llega a Postgres por el nombre del servicio (`DB_HOST=postgres`) y a Ollama por `host.docker.internal:11434`. Esos valores se definen en el `docker-compose.yml`.
+- El índice del RAG vive en el volumen de Docker `chroma_data`, distinto de la carpeta `chroma_db/` de tu computador.
+- Si la API no responde, revisa el log con `docker-compose logs api`.
+
+### Opción B: sin Docker para la API
+
+1. Levanta solo la base de datos:
+   ```
+   docker-compose up -d postgres
+   ```
+2. Instala las dependencias y crea tu `.env`:
+   ```
+   pip install -r requirements.txt
+   copy .env.example .env
+   ```
+3. Indexa los PDFs y corre la API:
    ```
    python -m rag.ingest
-   ```
-4. **Corre la API:**
-   ```
    uvicorn app.main:app --host 127.0.0.1 --port 8000
    ```
-5. **Prueba** en http://127.0.0.1:8000/docs
 
 > `init.sql` solo se ejecuta cuando el volumen de Postgres está vacío. Si cambias la tabla, usa `docker-compose down -v` (borra los datos) y vuelve a levantar.
+>
+> No ejecutes la API en Docker y en local a la vez: usan el mismo puerto 8000.
 
 ## Ejemplo
 
@@ -171,6 +220,14 @@ python -m eval.run_eval
 ```
 
 Corre el agente sobre `eval/dataset.json` (15 tickets: 6 urgentes y 9 no urgentes, con casos ambiguos a propósito y uno en inglés) y compara con las etiquetas. Usa `clasificar_ticket`, que **no escribe en la base de datos**, así que la evaluación no ensucia la tabla.
+
+También se puede correr dentro de Docker, con la misma configuración que usa la API:
+
+```
+docker-compose run --rm api python -m eval.run_eval
+```
+
+Con la API dockerizada se obtuvo el mismo resultado que en local: 15/15 en urgencia, 14/15 en categoría y 0 errores. En esa corrida el ticket 1 volvió a salir como `facturacion`, y la tabla solo tenía un ticket (el de inicio de sesión), sin tickets de pagos previos. Es coherente con la hipótesis de abajo, pero no la prueba.
 
 ### Resultados por variante
 
@@ -238,6 +295,10 @@ Problemas detectados al revisarlo:
 | `app/routes.py` (nuevo) | Endpoints con `response_model=TicketOut`; el error se registra en el log y el cliente recibe un mensaje genérico. | La salida queda validada y documentada en `/docs`; no se filtran detalles internos. |
 | `eval/dataset.json` y `eval/run_eval.py` (nuevos) | Set de 15 tickets y script de evaluación. | Poder responder "¿cómo mediste si funciona?". |
 | `legacy/` | Copias de `main.py`, `agent.py` y `rag.py` originales. | Conservar el flujo original para comparar. |
+| `Dockerfile` (reescrito) | El original copiaba `model/agent.py` y `model/rag.py`, que ya no existen, así que no se podía construir. Se borró y se creó uno nuevo que copia `app/`, `agent/`, `rag/`, `db/` y `eval/`. | Poder construir una imagen de la API con la estructura nueva. El original sigue en la rama `legacy`. |
+| `.dockerignore` (nuevo) | Excluye `venv/`, `.git/`, `.env`, `chroma_db/`, `legacy/` y archivos de caché. | Que la contraseña del `.env` y el entorno virtual no entren a la imagen. |
+| `docker-compose.yml` (ampliado) | Nuevo servicio `api` con `env_file`, `DB_HOST=postgres`, `OLLAMA_HOST=http://host.docker.internal:11434`, volumen `chroma_data` para el índice, montaje de solo lectura de `data/` y `depends_on` con el `healthcheck` de Postgres. Las credenciales de n8n pasaron a variables del `.env`. | Levantar todo con un comando; que la API llegue a Postgres y a Ollama desde el contenedor; no dejar contraseñas escritas en un archivo que se sube a GitHub. |
+| `.env.example` | Se agregaron `N8N_USER` y `N8N_PASSWORD`. | Plantilla completa sin secretos. |
 
 ### Cambios por función (`agent/builder.py`)
 
@@ -270,6 +331,23 @@ Durante el desarrollo se usaron scripts temporales. No forman parte del proyecto
 | `diagnostico.py` (con `ProviderStrategy`) | Por qué cayó la categoría a 7/15. | El agente **dejó de usar herramientas**: con el formato forzado por Ollama, la primera respuesta ya es el JSON final. Esa variante es un clasificador de un paso, no un agente, y se descartó. |
 | `diagnostico3.py` | Por qué fallaba el ticket 4. | Tras leer el resultado de `tickets_similares`, el modelo respondió **vacío**. Es un fallo distinto al anterior y motivó el reintento con continuación. |
 
+### Pruebas de la dockerización
+
+| Prueba | Qué verificaba | Qué se encontró |
+|---|---|---|
+| `docker-compose up -d` y `docker-compose ps` | Que los contenedores arrancan. | Postgres sale `healthy` y la API `Up` en el puerto 8000. |
+| `docker-compose run --rm api python -m rag.ingest` | Que la API llega a Ollama desde el contenedor y que indexa en el volumen. | Mismas 100 páginas y 361 chunks que en local, con un `POST http://host.docker.internal:11434/api/embed` con `200 OK`. |
+| Dos tickets en `/docs` y `SELECT` en Postgres | El camino completo: API, agente, base de datos. | El ticket de consulta salió sin guardar y el de inicio de sesión salió urgente, `tecnico` y guardado, con su fila en la tabla. |
+| `docker-compose run --rm api python -m eval.run_eval` | Que el contenedor se comporta como el entorno local. | 15/15 en urgencia, 14/15 en categoría y 0 errores. |
+
+Un problema encontrado: la primera imagen construida falló con `ModuleNotFoundError: No module named 'app'` y la API se cayó al arrancar. Se reconstruyó con `docker-compose build --no-cache api` y funcionó. **No se determinó la causa**; la hipótesis, sin verificar, es que la primera imagen se construyó con algo distinto al `Dockerfile` actual.
+
+### Ramas de Git
+
+- `main`: el proyecto actual.
+- `legacy`: el proyecto original (flujo LangGraph con `model/`, el `Dockerfile` viejo y `llama3`), guardado tal como estaba antes de convertirlo en agente.
+- `docker`: la rama donde se desarrolló la dockerización, antes de unirla a `main`.
+
 ### Hallazgos principales
 
 1. **El prompt no garantiza que el modelo use una herramienta.** Se midió y se resolvió moviendo la acción crítica (guardar) al código.
@@ -285,7 +363,9 @@ Durante el desarrollo se usaron scripts temporales. No forman parte del proyecto
 - **Formato inestable en modelos de 7B:** el reintento lo reduce, pero no lo elimina por completo. Si fallan todos los intentos, la API devuelve 500.
 - **`tickets_similares` usa coincidencia de texto (`ILIKE`)**, no búsqueda semántica. Una mejora sería usar `pgvector`.
 - **Los tickets guardados influyen en las búsquedas del agente.** Los tickets de prueba en la tabla aparecieron en `tickets_similares`.
-- **n8n está en el compose pero no está conectado** a la API.
+- **n8n está en el compose pero no está conectado** a la API. Además, las variables `N8N_BASIC_AUTH_*` probablemente ya no tienen efecto en las versiones recientes de n8n (no se verificó).
+- **Ollama no está dockerizado:** el contenedor de la API depende de que Ollama esté corriendo en el computador anfitrión, accesible por `host.docker.internal`. Probado en Docker Desktop con Windows. En otros sistemas puede requerir ajustes.
+- **Credenciales antiguas en el historial de Git:** el `docker-compose.yml` original tenía contraseñas de desarrollo escritas, y siguen en commits anteriores aunque ya se movieron al `.env`. No deben reutilizarse en ningún otro sitio.
 - **No hay tests automáticos** (por ejemplo con `pytest`); la verificación se hizo con los scripts de arriba y la evaluación.
 - `langchain-community` está en proceso de retiro (aparece un `DeprecationWarning` al cargar PDFs con `PyPDFLoader`).
 
@@ -297,4 +377,3 @@ Durante el desarrollo se usaron scripts temporales. No forman parte del proyecto
 - Exponer una de las herramientas como servidor MCP.
 - Conectar n8n a la API con un webhook.
 - Agregar tests con `pytest`.
-- Dockerizar la API: el Dockerfile original quedó en la rama `legacy`. Hay que actualizarlo a la estructura nueva y configurar `OLLAMA_HOST` y `DB_HOST` para que funcione dentro de Docker.
