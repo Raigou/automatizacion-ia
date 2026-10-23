@@ -369,6 +369,7 @@ Cada etapa del proyecto queda guardada en su propia rama:
 - **n8n está en el compose pero no está conectado** a la API. Además, las variables `N8N_BASIC_AUTH_*` probablemente ya no tienen efecto en las versiones recientes de n8n (no se verificó).
 - **Ollama no está dockerizado:** el contenedor de la API depende de que Ollama esté corriendo en el computador anfitrión, accesible por `host.docker.internal`. Probado en Docker Desktop con Windows. En otros sistemas puede requerir ajustes.
 - **Credenciales antiguas en el historial de Git:** el `docker-compose.yml` original tenía contraseñas de desarrollo escritas, y siguen en commits anteriores aunque ya se movieron al `.env`. No deben reutilizarse en ningún otro sitio.
+- **El montaje de `init.sql` tenía la ruta mal escrita** (`.db/init.sql` en vez de `./db/init.sql`) y no se notó, porque `init.sql` solo se ejecuta con el volumen de Postgres vacío y el volumen de desarrollo ya tenía la tabla. Se corrigió y se verificó con `docker-compose config` que la ruta apunta al archivo real, pero **no se ha probado la creación automática de la tabla desde un volumen vacío**.
 - **No hay tests automáticos** (por ejemplo con `pytest`); la verificación se hizo con los scripts de arriba y la evaluación.
 - `langchain-community` está en proceso de retiro (aparece un `DeprecationWarning` al cargar PDFs con `PyPDFLoader`).
 
